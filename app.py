@@ -119,7 +119,14 @@ VOL_MULTS: Dict[str, float] = {
     "crypto":    0.80,
 }
 
-MIN_BARS = 130  # minimum bars required; need NORM_LEN + headroom
+MIN_BARS = 130          # default — need NORM_LEN + headroom
+MIN_BARS_AC: Dict[str, int] = {   # per-asset-class overrides
+    "us_equity":  130,
+    "ihsg":        80,   # some JK stocks have shorter history
+    "forex":       80,   # some exotic pairs thinner
+    "commodities": 80,   # grains futures can roll-gap
+    "crypto":      80,
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — UNIVERSE  &  MACRO QUAD POLICY
@@ -565,7 +572,7 @@ def compute_trrlrr(df: pd.DataFrame, vol_mult: float = 1.0) -> Optional[Dict]:
     Input: daily OHLCV DataFrame (columns: Open, High, Low, Close, Volume).
     Returns: result dict for the LAST bar, or None if insufficient data.
     """
-    if df is None or len(df) < MIN_BARS:
+    if df is None or len(df) < 63:  # absolute floor = TREND_LEN
         return None
 
     h = df["High"].ffill()
@@ -890,32 +897,121 @@ def compute_trrlrr(df: pd.DataFrame, vol_mult: float = 1.0) -> Optional[Dict]:
 
 BENCHMARK_TICKERS = ["SPY", "IWM", "GLD", "GC=F", "CL=F", "TLT", "^VIX", "HYG", "LQD"]
 
+def _extract_ticker_df(raw: pd.DataFrame, tk: str) -> Optional[pd.DataFrame]:
+    """
+    Extract single-ticker DataFrame from yfinance batch download result.
+
+    yfinance <= 0.1.x : MultiIndex (Ticker, Field)  → raw[tk]
+    yfinance >= 0.2.x : MultiIndex (Field, Ticker)  → raw.xs(tk, axis=1, level=1)
+    yfinance single   : flat columns                → raw directly
+    """
+    if not isinstance(raw.columns, pd.MultiIndex):
+        # Single-ticker download or flat columns
+        return raw.copy()
+
+    lvl0 = raw.columns.get_level_values(0).unique().tolist()
+    lvl1 = raw.columns.get_level_values(1).unique().tolist()
+
+    # yfinance 1.x: level-0 = field names (Close, Open …), level-1 = tickers
+    if tk in lvl1:
+        try:
+            df = raw.xs(tk, axis=1, level=1)
+            # Rename "Adj Close" → "Close" if needed
+            if "Adj Close" in df.columns and "Close" not in df.columns:
+                df = df.rename(columns={"Adj Close": "Close"})
+            return df.copy()
+        except Exception:
+            pass
+
+    # yfinance old style: level-0 = tickers, level-1 = field names
+    if tk in lvl0:
+        try:
+            return raw[tk].copy()
+        except Exception:
+            pass
+
+    return None
+
+
+def _clean_df(df: pd.DataFrame, min_bars: int) -> Optional[pd.DataFrame]:
+    """Standardise OHLCV, forward-fill, drop NaN, enforce min bar count."""
+    if df is None or df.empty:
+        return None
+    # Accept "Adj Close" as "Close" fallback
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df = df.rename(columns={"Adj Close": "Close"})
+    needed = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if "Close" not in needed:
+        return None
+    df = df[needed].copy()
+    # Ensure Volume column exists (forex has no volume)
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+    df = df.ffill().dropna(subset=["Close"])
+    if len(df) < min_bars:
+        return None
+    return df
+
+
+def _fetch_single(tk: str, period: str) -> Optional[pd.DataFrame]:
+    """Individual ticker download — used as fallback."""
+    try:
+        raw = yf.download(tk, period=period, auto_adjust=True,
+                          progress=False, threads=False)
+        ac, _ = UNIVERSE.get(tk, ("us_equity", ""))
+        return _clean_df(raw, MIN_BARS_AC.get(ac, MIN_BARS))
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_all(period: str = "5y") -> Dict[str, pd.DataFrame]:
-    """Download daily OHLCV for all universe + benchmark tickers."""
+    """
+    Download daily OHLCV for all universe + benchmark tickers.
+
+    Strategy:
+      1. Batch download all tickers at once (fast path).
+      2. For any ticker that fails or has <min_bars, retry individually (slow path).
+    Compatible with yfinance 0.1.x, 0.2.x, and 1.x MultiIndex layouts.
+    """
     all_tickers = list(set(list(UNIVERSE.keys()) + BENCHMARK_TICKERS))
+    result: Dict[str, pd.DataFrame] = {}
+    need_fallback: list = []
+
+    # ── Pass 1: batch download ────────────────────────────────────────────────
     try:
         raw = yf.download(
             all_tickers, period=period, auto_adjust=True,
-            progress=False, threads=True, group_by="ticker",
+            progress=False, threads=True,
         )
+        for tk in all_tickers:
+            ac, _ = UNIVERSE.get(tk, ("us_equity", ""))
+            mb = MIN_BARS_AC.get(ac, MIN_BARS)
+            try:
+                df_raw = _extract_ticker_df(raw, tk)
+                df = _clean_df(df_raw, mb)
+                if df is not None:
+                    result[tk] = df
+                else:
+                    need_fallback.append(tk)
+            except Exception:
+                need_fallback.append(tk)
     except Exception as e:
-        st.error(f"Data fetch error: {e}")
-        return {}
+        # Batch failed entirely — fall back all
+        need_fallback = all_tickers
 
-    result: Dict[str, pd.DataFrame] = {}
-    for tk in all_tickers:
-        try:
-            if isinstance(raw.columns, pd.MultiIndex):
-                df = raw[tk].copy() if tk in raw.columns.get_level_values(0) else None
-            else:
-                df = raw.copy() if len(all_tickers) == 1 else None
-            if df is not None and not df.empty and len(df) >= MIN_BARS:
-                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-                df = df.ffill().dropna(subset=["Close"])
-                result[tk] = df
-        except Exception:
-            pass
+    # ── Pass 2: individual fallback for missing tickers ───────────────────────
+    if need_fallback:
+        def _fetch(tk: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            return tk, _fetch_single(tk, period)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_fetch, tk): tk for tk in need_fallback}
+            for fut in concurrent.futures.as_completed(futs):
+                tk, df = fut.result()
+                if df is not None:
+                    result[tk] = df
+
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1098,9 +1194,10 @@ def scan_one(ticker: str, data: Dict[str, pd.DataFrame], quad: str) -> Optional[
     }
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_scan(period: str = "5y") -> Tuple[pd.DataFrame, str, float, Dict, str, float]:
+def run_scan(period: str = "5y") -> Tuple[pd.DataFrame, str, float, Dict, str, float, Dict]:
     """
     Full scan: fetch → quad → compute all tickers → return results df.
+    Returns: (df, quad, conf, detail, exec_state, exec_score, data)
     """
     data = fetch_all(period)
     quad, conf, detail = determine_quad(data)
@@ -1121,10 +1218,10 @@ def run_scan(period: str = "5y") -> Tuple[pd.DataFrame, str, float, Dict, str, f
                 pass
 
     if not results:
-        return pd.DataFrame(), quad, conf, detail, exec_state, exec_score
+        return pd.DataFrame(), quad, conf, detail, exec_state, exec_score, data
 
     df = pd.DataFrame(results).sort_values("_launch", ascending=False)
-    return df, quad, conf, detail, exec_state, exec_score
+    return df, quad, conf, detail, exec_state, exec_score, data
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 13 — UI HELPERS
@@ -1252,7 +1349,7 @@ def main():
 
     # ── Run scan ─────────────────────────────────────────────────────────────
     with st.spinner("Running TRR/LRR scan across all universes…"):
-        df_all, quad_auto, quad_conf, quad_detail, exec_state, exec_score = run_scan(period)
+        df_all, quad_auto, quad_conf, quad_detail, exec_state, exec_score, data = run_scan(period)
 
     quad = override_quad if override_quad != "Auto-detect" else quad_auto
 
@@ -1310,12 +1407,14 @@ def main():
     n_wl    = len(df[df["_signal"] == "WATCH LONG"])
     n_ws    = len(df[df["_signal"] == "WATCH SHORT"])
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: mc("Scan Universe", f"{len(UNIVERSE)} tickers", f"{len(df_all)} had signals")
-    with c2: mc("🟢 LONG",     str(n_long),  f"Triggered signals",       "good")
-    with c3: mc("🔴 SHORT",    str(n_short), f"Triggered signals",        "bad")
-    with c4: mc("🟡 WATCH ▲▼", f"{n_wl}▲ / {n_ws}▼", "Near-trigger",    "warn")
-    with c5: mc("Showing",     str(len(df)), f"after filters",            "neu")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    loaded = sum(1 for tk in UNIVERSE if tk in data)
+    with c1: mc("Data Coverage", f"{loaded}/{len(UNIVERSE)}", f"tickers loaded", "neu" if loaded == len(UNIVERSE) else "warn")
+    with c2: mc("Scan Universe", f"{len(UNIVERSE)} tickers", f"{len(df_all)} had signals")
+    with c3: mc("🟢 LONG",     str(n_long),  f"Triggered signals",       "good")
+    with c4: mc("🔴 SHORT",    str(n_short), f"Triggered signals",        "bad")
+    with c5: mc("🟡 WATCH ▲▼", f"{n_wl}▲ / {n_ws}▼", "Near-trigger",    "warn")
+    with c6: mc("Showing",     str(len(df)), f"after filters",            "neu")
 
     st.markdown("---")
 
