@@ -122,9 +122,9 @@ VOL_MULTS: Dict[str, float] = {
 MIN_BARS = 130          # default — need NORM_LEN + headroom
 MIN_BARS_AC: Dict[str, int] = {   # per-asset-class overrides
     "us_equity":  130,
-    "ihsg":        80,   # some JK stocks have shorter history
-    "forex":       80,   # some exotic pairs thinner
-    "commodities": 80,   # grains futures can roll-gap
+    "ihsg":        63,   # some newer JK listings have shorter history
+    "forex":       63,   # exotic pairs (IDR, CNH, SGD) can be thinner
+    "commodities": 80,   # grains futures can have roll-gaps
     "crypto":      80,
 }
 
@@ -953,15 +953,51 @@ def _clean_df(df: pd.DataFrame, min_bars: int) -> Optional[pd.DataFrame]:
     return df
 
 
+# Alternative symbols tried in order if primary fails.
+# Key = canonical ticker used throughout codebase;
+# Value = list to try (canonical first, then alternatives).
+TICKER_ALIASES: Dict[str, List[str]] = {
+    # Forex USD pairs — yfinance accepts both conventions
+    "JPY=X":    ["JPY=X",  "USDJPY=X"],
+    "CHF=X":    ["CHF=X",  "USDCHF=X"],
+    "CAD=X":    ["CAD=X",  "USDCAD=X"],
+    "IDR=X":    ["IDR=X",  "USDIDR=X"],
+    "CNH=X":    ["CNH=X",  "USDCNH=X"],
+    "SGD=X":    ["SGD=X",  "USDSGD=X"],
+    # Brent fallback to WTI if Brent contract is empty
+    "BZ=F":     ["BZ=F",   "CL=F"],
+    # Grains — try generic continuous then specific front-month hints
+    "ZC=F":     ["ZC=F",   "ZC=1"],
+    "ZW=F":     ["ZW=F",   "ZW=1"],
+    "ZS=F":     ["ZS=F",   "ZS=1"],
+}
+
+# Period cascade: if primary period doesn't yield enough bars, try shorter ones
+_PERIOD_CASCADE = ["5y", "3y", "2y", "1y"]
+
+
 def _fetch_single(tk: str, period: str) -> Optional[pd.DataFrame]:
-    """Individual ticker download — used as fallback."""
-    try:
-        raw = yf.download(tk, period=period, auto_adjust=True,
-                          progress=False, threads=False)
-        ac, _ = UNIVERSE.get(tk, ("us_equity", ""))
-        return _clean_df(raw, MIN_BARS_AC.get(ac, MIN_BARS))
-    except Exception:
-        return None
+    """
+    Individual ticker download with alias and period cascade.
+    Tries each alias symbol × each period until we get a valid df.
+    """
+    ac, _ = UNIVERSE.get(tk, ("us_equity", ""))
+    mb = MIN_BARS_AC.get(ac, MIN_BARS)
+    aliases = TICKER_ALIASES.get(tk, [tk])
+    # Always start from the requested period then fall back
+    periods = ([period] + [p for p in _PERIOD_CASCADE if p != period])
+
+    for sym in aliases:
+        for per in periods:
+            try:
+                raw = yf.download(sym, period=per, auto_adjust=True,
+                                  progress=False, threads=False)
+                df = _clean_df(raw, mb)
+                if df is not None:
+                    return df
+            except Exception:
+                continue
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
